@@ -1,0 +1,14 @@
+{
+	"luci-app-airoha-npu": {
+		"description": "Grant access to Airoha NPU status",
+		"read": {
+			"ubus": {
+				"luci.airoha_npu": [ "getStatus", "getPpeEntries" ]
+			},
+			"file": {
+				"/sys/kernel/debug/ppe/entries": [ "read" ],
+				"/sys/kernel/debug/ppe/bind": [ "read" ]
+			}
+		}
+	}
+}

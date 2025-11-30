@@ -1,0 +1,14 @@
+{
+	"admin/status/npu": {
+		"title": "NPU Status",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "airoha_npu/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-airoha-npu" ],
+			"uci": { }
+		}
+	}
+}

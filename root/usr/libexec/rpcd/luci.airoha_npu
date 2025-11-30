@@ -1,0 +1,228 @@
+#!/bin/sh
+
+# Airoha NPU Status RPC backend for LuCI
+
+. /lib/functions.sh
+
+get_npu_version() {
+	# Try to get NPU version from dmesg (from airoha-npu driver)
+	local npu_ver=$(dmesg | grep -i "npu.*version" | tail -1 | sed -n 's/.*version[: ]*\([0-9.]*\).*/\1/p')
+
+	# Try mt7996 NPU version
+	local wifi_npu_ver=$(dmesg | grep -i "mt7996.*npu version" | tail -1 | sed -n 's/.*NPU version[: ]*\([0-9.]*\).*/\1/p')
+
+	# Check if NPU firmware is loaded
+	local npu_loaded="false"
+	if dmesg | grep -q "airoha-npu.*firmware loaded\|NPU version"; then
+		npu_loaded="true"
+	fi
+
+	echo "{\"npu_version\":\"${npu_ver:-Unknown}\",\"wifi_npu_version\":\"${wifi_npu_ver:-Not loaded}\",\"npu_loaded\":${npu_loaded}}"
+}
+
+get_memory_regions() {
+	# Parse NPU reserved memory regions from dmesg
+	local regions="["
+	local first=1
+
+	dmesg | grep "reserved mem.*npu" | while read line; do
+		local start=$(echo "$line" | sed -n 's/.*0x\([0-9a-fA-F]*\)\.\..*/\1/p')
+		local end=$(echo "$line" | sed -n 's/.*\.\.\(0x[0-9a-fA-F]*\).*/\1/p')
+		local size=$(echo "$line" | sed -n 's/.*(\([0-9]* [KMG]*B\)).*/\1/p')
+		local name=$(echo "$line" | sed -n 's/.*non-reusable \([^ ]*\)/\1/p')
+
+		if [ -n "$start" ] && [ -n "$name" ]; then
+			[ $first -eq 0 ] && echo -n ","
+			first=0
+			echo -n "{\"name\":\"$name\",\"start\":\"0x$start\",\"end\":\"$end\",\"size\":\"$size\"}"
+		fi
+	done
+	echo "]"
+}
+
+get_status() {
+	# Get NPU firmware version from the firmware binary itself
+	local npu_fw="/lib/firmware/airoha/en7581_npu_rv32.bin"
+	local npu_ver="Unknown"
+
+	if [ -f "$npu_fw" ]; then
+		# Extract TLB version string from firmware binary
+		# Handles formats: "2.1.1-TLB7.3.283.1456-62", "TLB7.7.0.0_v01", "TLB7.3.283.2400-32"
+		npu_ver=$(strings "$npu_fw" 2>/dev/null | grep -oE '([0-9]+\.[0-9]+\.[0-9]+-)?TLB[0-9.]+[-_v0-9]*' | head -1)
+		[ -z "$npu_ver" ] && npu_ver="Unknown"
+	fi
+
+	# Check if NPU device is bound (active) by looking for *.npu symlink in driver directory
+	local npu_loaded="false"
+	local npu_device=""
+	local npu_driver_path="/sys/bus/platform/drivers/airoha-npu"
+
+	if [ -d "$npu_driver_path" ]; then
+		# Find any bound NPU device (e.g., 1e900000.npu)
+		npu_device=$(ls -1 "$npu_driver_path" 2>/dev/null | grep '\.npu$' | head -1)
+		if [ -n "$npu_device" ]; then
+			npu_loaded="true"
+		fi
+	fi
+
+	# Get NPU clock speed (Hz -> MHz)
+	local npu_clock=0
+	if [ -f "/sys/kernel/debug/clk/npu/clk_rate" ]; then
+		npu_clock=$(cat /sys/kernel/debug/clk/npu/clk_rate 2>/dev/null || echo 0)
+	fi
+
+	# Count NPU cores from watchdog IRQs (airoha-npu-wdt)
+	local npu_cores=$(grep -c "airoha-npu-wdt" /proc/interrupts 2>/dev/null || echo 0)
+
+	# Get offload statistics from bound entries
+	local offload_stats=$(cat /sys/kernel/debug/ppe/bind 2>/dev/null | awk '
+	BEGIN { total_pkts=0; total_bytes=0 }
+	{
+		match($0, /packets=[0-9]+/)
+		if (RSTART > 0) { total_pkts += substr($0, RSTART+8, RLENGTH-8) }
+		match($0, /bytes=[0-9]+/)
+		if (RSTART > 0) { total_bytes += substr($0, RSTART+6, RLENGTH-6) }
+	}
+	END { printf "%d %d", total_pkts, total_bytes }
+	')
+	local offload_packets=$(echo "$offload_stats" | cut -d' ' -f1)
+	local offload_bytes=$(echo "$offload_stats" | cut -d' ' -f2)
+
+	# Get memory regions
+	local regions="["
+	local first=1
+	for line in $(dmesg | grep "reserved mem.*npu" 2>/dev/null); do
+		:
+	done
+
+	# Simplified memory region parsing
+	local mem_info=$(dmesg | grep "reserved mem.*npu" | head -4)
+	local regions="[]"
+
+	if [ -n "$mem_info" ]; then
+		regions=$(echo "$mem_info" | awk '
+		BEGIN { printf "[" }
+		{
+			if (NR > 1) printf ","
+			match($0, /0x[0-9a-fA-F]+\.\.0x[0-9a-fA-F]+/)
+			range = substr($0, RSTART, RLENGTH)
+			split(range, a, "\\.\\.")
+
+			match($0, /\([0-9]+ [KMG]i?B\)/)
+			size = substr($0, RSTART+1, RLENGTH-2)
+
+			match($0, /non-reusable [^ ]+/)
+			name = substr($0, RSTART+13)
+			gsub(/@.*/, "", name)
+
+			printf "{\"name\":\"%s\",\"start\":\"%s\",\"end\":\"%s\",\"size\":\"%s\"}", name, a[1], a[2], size
+		}
+		END { printf "]" }
+		')
+	fi
+
+	printf '{"npu_version":"%s","npu_loaded":%s,"npu_device":"%s","npu_clock":%d,"npu_cores":%d,"offload_packets":%d,"offload_bytes":%d,"memory_regions":%s}' \
+		"${npu_ver:-Unknown}" "$npu_loaded" "${npu_device:-}" "${npu_clock:-0}" "${npu_cores:-0}" "${offload_packets:-0}" "${offload_bytes:-0}" "$regions"
+}
+
+get_ppe_entries() {
+	local entries_file="/sys/kernel/debug/ppe/entries"
+
+	if [ ! -f "$entries_file" ]; then
+		echo '{"entries":[]}'
+		return
+	fi
+
+	# Parse PPE entries
+	# Format: INDEX STATE TYPE [SUBTYPE] orig=... new=... eth=... packets=N bytes=N
+	# Example: 00950 UNB IPv4 5T orig=10.42.1.227:42400->224.0.0.251:0 new=...
+	# Example: 026a4 UNB     L2B eth=...
+	awk '
+	BEGIN {
+		printf "{\"entries\":["
+		first = 1
+	}
+	/^[0-9a-fA-F]+ / {
+		if (first == 0) printf ","
+		first = 0
+
+		# Parse index and state (first two fields)
+		index_val = $1
+		state = $2
+
+		# Determine type - could be IPv4, IPv6, or L2B
+		type = ""
+		subtype = ""
+		if ($3 == "IPv4" || $3 == "IPv6") {
+			type = $3
+			subtype = $4
+		} else if ($3 == "L2B" || $4 == "L2B") {
+			type = "L2B"
+			subtype = ""
+		} else {
+			type = $3
+			subtype = $4
+		}
+
+		# Extract orig= field (IP flows)
+		orig = ""
+		match($0, /orig=[^ ]+/)
+		if (RSTART > 0) {
+			orig = substr($0, RSTART+5, RLENGTH-5)
+		}
+
+		# Extract new= field
+		new_flow = ""
+		match($0, /new=[^ ]+/)
+		if (RSTART > 0) {
+			new_flow = substr($0, RSTART+4, RLENGTH-4)
+		}
+
+		# Extract eth= field (for L2B entries)
+		eth = ""
+		match($0, /eth=[^ ]+/)
+		if (RSTART > 0) {
+			eth = substr($0, RSTART+4, RLENGTH-4)
+		}
+
+		# Extract packets=
+		packets = 0
+		match($0, /packets=[0-9]+/)
+		if (RSTART > 0) {
+			packets = substr($0, RSTART+8, RLENGTH-8)
+		}
+
+		# Extract bytes=
+		bytes = 0
+		match($0, /bytes=[0-9]+/)
+		if (RSTART > 0) {
+			bytes = substr($0, RSTART+6, RLENGTH-6)
+		}
+
+		printf "{\"index\":\"%s\",\"state\":\"%s\",\"type\":\"%s %s\",\"orig\":\"%s\",\"new_flow\":\"%s\",\"eth\":\"%s\",\"packets\":%d,\"bytes\":%d}", \
+			index_val, state, type, subtype, orig, new_flow, eth, packets, bytes
+	}
+	END {
+		printf "]}"
+	}
+	' "$entries_file" 2>/dev/null || echo '{"entries":[]}'
+}
+
+case "$1" in
+	list)
+		echo '{"getStatus":{},"getPpeEntries":{}}'
+		;;
+	call)
+		case "$2" in
+			getStatus)
+				get_status
+				;;
+			getPpeEntries)
+				get_ppe_entries
+				;;
+			*)
+				echo '{"error":"Invalid method"}'
+				;;
+		esac
+		;;
+esac
