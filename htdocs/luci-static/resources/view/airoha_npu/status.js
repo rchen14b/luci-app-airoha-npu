@@ -305,8 +305,8 @@ function renderFeDiagram(fe, ti, st) {
 		// Row 2: CDM1/CDM2 (CPU) + CDM4/WiFi
 		E('div', { 'style': 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px' }, [
 			cdmCard('cdm1', 'CDM1', 'CPU DMA 1', 'P0'),
-			cdmCard('cdm2', 'CDM2', 'CPU DMA 2', 'P5'),
-			cdm4WiFi
+			cdmCard('cdm2', 'CDM2', 'CPU DMA 2', 'P5')
+			//,cdm4WiFi
 		]),
 		// Row 3: PPE + NPU
 		E('div', { 'style': 'display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px' }, [
